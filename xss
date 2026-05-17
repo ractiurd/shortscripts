@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+DOMAIN=""
+OUTPUT_DIR=""
+THREADS=10
+TIMEOUT=30
+
+log() {
+    local level="$1"; shift
+    local msg="$*"
+    case "$level" in
+        INFO)  echo -e "${GREEN}[+]${NC} $msg" ;;
+        WARN)  echo -e "${YELLOW}[!]${NC} $msg" ;;
+        ERROR) echo -e "${RED}[-]${NC} $msg" ;;
+        DEBUG) echo -e "${BLUE}[*]${NC} $msg" ;;
+    esac
+}
+
+usage() {
+    cat << EOF
+Usage: $0 -d domain.com -o output_folder [options]
+
+Required:
+    -d DOMAIN       Target domain (e.g., example.com)
+    -o OUTPUT       Output folder for results
+
+Options:
+    -t THREADS      Number of threads (default: 10)
+    -T TIMEOUT      Timeout in seconds (default: 30)
+    -h              Show this help
+
+EOF
+    exit 1
+}
+
+while getopts "d:o:t:T:h" opt; do
+    case "$opt" in
+        d) DOMAIN="$OPTARG" ;;
+        o) OUTPUT_DIR="$OPTARG" ;;
+        t) THREADS="$OPTARG" ;;
+        T) TIMEOUT="$OPTARG" ;;
+        *) usage ;;
+    esac
+done
+
+[[ -z "$DOMAIN" ]] && log ERROR "Domain required with -d" && usage
+[[ -z "$OUTPUT_DIR" ]] && log ERROR "Output folder required with -o" && usage
+
+if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]; then
+    log ERROR "Invalid domain: $DOMAIN"
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR" || { log ERROR "Cannot create output dir"; exit 1; }
+
+log INFO "=========================================="
+log INFO "XSS Recon - Target: $DOMAIN"
+log INFO "=========================================="
+
+# ---- Tool Checker ----
+
+TOOLS_NEEDED=(
+    "subfinder:subdomain enum"
+    "httpx:HTTP probing"
+    "gau:URL collection"
+    "katana:crawling"
+    "gf:XSS pattern matching"
+    "dupl:URL deduplication"
+)
+
+missing=0
+log INFO "Checking required tools..."
+for entry in "${TOOLS_NEEDED[@]}"; do
+    tool="${entry%%:*}"
+    desc="${entry##*:}"
+    if ! command -v "$tool" &>/dev/null; then
+        log ERROR "Missing: $tool ($desc)"
+        missing=1
+    else
+        log INFO "Found: $tool"
+    fi
+done
+
+if [[ $missing -eq 1 ]]; then
+    log ERROR "Install missing tools before running."
+    echo ""
+    log INFO "Install commands:"
+    echo "  go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+    echo "  go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
+    echo "  go install github.com/lc/gau/v2/cmd/gau@latest"
+    echo "  go install github.com/projectdiscovery/katana/cmd/katana@latest"
+    echo "  go install github.com/tomnomnom/gf@latest"
+    echo "  go build -o dupl dupl.go  # URL deduplication tool"
+    echo "  (custom) Install ghoulsight and anew to \$PATH"
+    echo "  source ~/.gf/.gfrc  # or copy gf patterns"
+    exit 1
+fi
+
+# ---- Step 1: Subdomain Enumeration ----
+
+log INFO "[Step 1/5] Collecting subdomains for $DOMAIN..."
+
+subfinder -d "$DOMAIN" -silent -t "$THREADS" -o "$OUTPUT_DIR/subs_subfinder.txt" 2>/dev/null
+
+if command -v assetfinder &>/dev/null; then
+    log INFO "Running assetfinder..."
+    assetfinder --subs-only "$DOMAIN" 2>/dev/null >> "$OUTPUT_DIR/subs_subfinder.txt"
+fi
+
+if command -v argus &>/dev/null; then
+    log INFO "Running argus (Shodan)..."
+    argus -d "$DOMAIN" -s 2>/dev/null | anew "$OUTPUT_DIR/subs_subfinder.txt" >/dev/null
+fi
+
+if command -v chaos &>/dev/null; then
+    log INFO "Running chaos (ProjectDiscovery)..."
+    chaos -d "$DOMAIN" -silent 2>/dev/null | anew "$OUTPUT_DIR/subs_subfinder.txt" >/dev/null
+fi
+
+if command -v crt &>/dev/null; then
+    log INFO "Running crt (crt.sh)..."
+    crt -d "$DOMAIN" 2>/dev/null | anew "$OUTPUT_DIR/subs_subfinder.txt" >/dev/null
+fi
+
+if command -v dnsx &>/dev/null; then
+    log INFO "Running dnsx (bruteforce)..."
+    echo "$DOMAIN" | dnsx -silent -a -resp 2>/dev/null | cut -d' ' -f1 | anew "$OUTPUT_DIR/subs_subfinder.txt" >/dev/null
+fi
+
+if command -v sublist3r &>/dev/null; then
+    log INFO "Running sublist3r..."
+    sublist3r -d "$DOMAIN" -t "$THREADS" -o "$OUTPUT_DIR/subs_sublist3r.txt" 2>/dev/null
+    cat "$OUTPUT_DIR/subs_sublist3r.txt" 2>/dev/null | anew "$OUTPUT_DIR/subs_subfinder.txt" >/dev/null
+fi
+
+cat "$OUTPUT_DIR"/subs_*.txt 2>/dev/null | sort -u > "$OUTPUT_DIR/all_subs.txt"
+sub_count=$(wc -l < "$OUTPUT_DIR/all_subs.txt" 2>/dev/null || echo 0)
+log INFO "Subdomains found: $sub_count"
+
+if [[ "$sub_count" -eq 0 ]]; then
+    log WARN "No subdomains found. Using base domain only."
+    echo "$DOMAIN" > "$OUTPUT_DIR/all_subs.txt"
+fi
+
+rm -f "$OUTPUT_DIR"/subs_*.txt
+
+# ---- Step 2: Probe Live Hosts ----
+
+log INFO "[Step 2/5] Probing live hosts with httpx..."
+
+httpx -l "$OUTPUT_DIR/all_subs.txt" -silent -status-code -title -threads "$THREADS" \
+    -timeout "$TIMEOUT" -o "$OUTPUT_DIR/httpx_raw.txt" 2>/dev/null
+
+cut -d' ' -f1 "$OUTPUT_DIR/httpx_raw.txt" 2>/dev/null | sort -u > "$OUTPUT_DIR/live_hosts.txt"
+live_count=$(wc -l < "$OUTPUT_DIR/live_hosts.txt" 2>/dev/null || echo 0)
+log INFO "Live hosts: $live_count"
+
+rm -f "$OUTPUT_DIR/all_subs.txt" "$OUTPUT_DIR/httpx_raw.txt"
+
+if [[ "$live_count" -eq 0 ]]; then
+    log ERROR "No live hosts. Exiting."
+    exit 1
+fi
+
+# ---- Step 3: URL Collection ----
+
+log INFO "[Step 3/5] Collecting URLs from live hosts..."
+
+if [[ -s "$OUTPUT_DIR/live_hosts.txt" ]]; then
+    gau "$DOMAIN" --threads "$THREADS" --timeout "$TIMEOUT" 2>/dev/null | \
+        anew "$OUTPUT_DIR/urls_gau.txt" >/dev/null
+fi
+
+if [[ -s "$OUTPUT_DIR/live_hosts.txt" ]]; then
+    katana -list "$OUTPUT_DIR/live_hosts.txt" -d 3 -jc -aff -c "$THREADS" -silent 2>/dev/null | \
+        anew "$OUTPUT_DIR/urls_katana.txt" >/dev/null
+fi
+
+if command -v waybackurls &>/dev/null; then
+    log INFO "Running waybackurls..."
+    cat "$OUTPUT_DIR/live_hosts.txt" | waybackurls 2>/dev/null | \
+        anew "$OUTPUT_DIR/urls_wayback.txt" >/dev/null
+fi
+
+if command -v hakrawler &>/dev/null; then
+    log INFO "Running hakrawler..."
+    cat "$OUTPUT_DIR/live_hosts.txt" | hakrawler -plain -d 3 -t "$THREADS" 2>/dev/null | \
+        anew "$OUTPUT_DIR/urls_hakrawler.txt" >/dev/null
+fi
+
+rm -f "$OUTPUT_DIR/live_hosts.txt"
+
+cat "$OUTPUT_DIR"/urls_*.txt 2>/dev/null | \
+    grep -Eo '^https?://[^[:space:]]+' | \
+    grep -i "$DOMAIN" | \
+    sort -u | dupl > "$OUTPUT_DIR/all_urls.txt"
+
+rm -f "$OUTPUT_DIR"/urls_*.txt
+
+grep -Ev '\.(jpg|jpeg|png|gif|svg|bmp|ico|css|woff|woff2|ttf|eot|otf|mp4|mp3|avi|mov|zip|rar|7z|tar|gz|pdf|doc|docx|xls|xlsx|ppt|pptx)(\?|$)' \
+    "$OUTPUT_DIR/all_urls.txt" 2>/dev/null > "$OUTPUT_DIR/clean_urls.txt" || cp "$OUTPUT_DIR/all_urls.txt" "$OUTPUT_DIR/clean_urls.txt"
+
+rm -f "$OUTPUT_DIR/all_urls.txt"
+
+url_count=$(wc -l < "$OUTPUT_DIR/clean_urls.txt" 2>/dev/null || echo 0)
+log INFO "Clean URLs collected: $url_count"
+
+if [[ "$url_count" -eq 0 ]]; then
+    log ERROR "No URLs collected. Exiting."
+    exit 1
+fi
+
+# ---- Step 4: Extract XSS URLs ----
+
+log INFO "[Step 4/5] Extracting XSS-pattern URLs with gf..."
+
+gf xss "$OUTPUT_DIR/clean_urls.txt" 2>/dev/null | sort -u > "$OUTPUT_DIR/xss_urls.txt"
+
+rm -f "$OUTPUT_DIR/clean_urls.txt"
+
+xss_count=$(wc -l < "$OUTPUT_DIR/xss_urls.txt" 2>/dev/null || echo 0)
+log INFO "XSS candidate URLs: $xss_count"
+
+if [[ "$xss_count" -eq 0 ]]; then
+    log WARN "No XSS-pattern URLs found."
+    log INFO "Done. No targets to scan."
+    exit 0
+fi
+
+# ---- Step 5: XSS Scanning ----
+
+log INFO "[Step 5/5] Scanning for XSS with ghoulsight..."
+
+cat "$OUTPUT_DIR/xss_urls.txt" | ghoulsight
+
+log INFO "=========================================="
+log INFO "XSS Recon complete!"
+log INFO "Results: $OUTPUT_DIR/xss_urls.txt"
+log INFO "=========================================="
